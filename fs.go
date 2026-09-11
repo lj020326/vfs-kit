@@ -20,9 +20,28 @@ type fileSystem struct {
 	temporary bool
 }
 
-func (fs *fileSystem) path(name string) string {
-	name = filepath.Clean("/" + name)
-	return filepath.Join(fs.root, filepath.FromSlash(name))
+// securePath maps a VFS path to a host path that is guaranteed to live inside
+// fs.root. It is the single containment check for every entry point of
+// fileSystem: Open, OpenFile, Lstat, Stat, Mkdir and Remove all go through it,
+// so a path can never be accepted by one entry point and rejected by another.
+//
+// A path that tries to climb above the VFS root is rejected with ErrInvalidPath
+// rather than silently rewritten, so callers get a diagnosable error.
+//
+// Note: containment is lexical. A symlink stored *inside* the VFS that points
+// outside of it is still followed by the operating system, exactly as it would
+// be inside a real chroot. Do not rely on a fileSystem as a security boundary
+// for a tree that untrusted code can create symlinks in.
+func (fs *fileSystem) securePath(name string) (string, error) {
+	cleaned := filepath.Clean(filepath.FromSlash(name))
+	if containsDotDot(cleaned) {
+		return "", ErrInvalidPath
+	}
+	full := filepath.Join(fs.root, cleaned)
+	if !isUnderRoot(fs.root, full) {
+		return "", ErrInvalidPath
+	}
+	return full, nil
 }
 
 // Root returns the root directory of the fileSystem, as an
@@ -37,17 +56,45 @@ func (fs *fileSystem) IsTemporary() bool {
 }
 
 func (fs *fileSystem) Open(path string) (RFile, error) {
-	f, err := os.Open(filepath.Join(fs.root, filepath.Clean(path)))
+	full, err := fs.securePath(path)
 	if err != nil {
 		return nil, err
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		return nil, fs.hideRoot(err)
 	}
 	return f, nil
 }
 
 var ErrInvalidPath = errors.New("invalid path: attempt to access parent directory")
 
+// containsDotDot reports whether path contains ".." as a whole path segment.
+// It deliberately does not use strings.Contains: names such as "v1..2.json" or
+// "..hidden" are legal file names and must not be rejected.
 func containsDotDot(path string) bool {
-	return strings.Contains(path, "..")
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// hideRoot rewrites the host path in a *fs.PathError back to the path the
+// caller asked for, so error strings do not leak the filesystem's real root.
+// The wrapped errno is preserved, so errors.Is(err, fs.ErrNotExist) and
+// os.IsNotExist keep working.
+func (fs *fileSystem) hideRoot(err error) error {
+	var pathErr *iofs.PathError
+	if !errors.As(err, &pathErr) {
+		return err
+	}
+	rel, relErr := filepath.Rel(fs.root, pathErr.Path)
+	if relErr != nil {
+		return err
+	}
+	return &iofs.PathError{Op: pathErr.Op, Path: filepath.ToSlash(filepath.Join("/", rel)), Err: pathErr.Err}
 }
 
 func isUnderRoot(root, path string) bool {
@@ -59,45 +106,39 @@ func isUnderRoot(root, path string) bool {
 }
 
 func (fs *fileSystem) OpenFile(path string, flag int, mode os.FileMode) (WFile, error) {
-	cleanPath := filepath.Clean(path)
-
-	if containsDotDot(cleanPath) {
-		return nil, ErrInvalidPath
-	}
-
-	fullPath := filepath.Join(fs.root, cleanPath)
-
-	// Resolve to absolute path to prevent path traversal
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		return nil, ErrInvalidPath
-	}
-
-	// Ensure the resolved path is within the root directory
-	if !isUnderRoot(fs.root, absPath) {
-		return nil, ErrInvalidPath
-	}
-
-	f, err := os.OpenFile(absPath, flag, mode)
+	full, err := fs.securePath(path)
 	if err != nil {
 		return nil, err
+	}
+
+	f, err := os.OpenFile(full, flag, mode)
+	if err != nil {
+		return nil, fs.hideRoot(err)
 	}
 
 	return f, nil
 }
 
 func (fs *fileSystem) Lstat(path string) (os.FileInfo, error) {
-	info, err := os.Lstat(fs.path(path))
+	full, err := fs.securePath(path)
 	if err != nil {
 		return nil, err
+	}
+	info, err := os.Lstat(full)
+	if err != nil {
+		return nil, fs.hideRoot(err)
 	}
 	return info, nil
 }
 
 func (fs *fileSystem) Stat(path string) (os.FileInfo, error) {
-	info, err := os.Stat(fs.path(path))
+	full, err := fs.securePath(path)
 	if err != nil {
 		return nil, err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return nil, fs.hideRoot(err)
 	}
 	return info, nil
 }
@@ -126,11 +167,19 @@ func (fs *fileSystem) ReadDir(path string) ([]os.FileInfo, error) {
 }
 
 func (fs *fileSystem) Mkdir(path string, perm os.FileMode) error {
-	return os.Mkdir(fs.path(path), perm)
+	full, err := fs.securePath(path)
+	if err != nil {
+		return err
+	}
+	return fs.hideRoot(os.Mkdir(full, perm))
 }
 
 func (fs *fileSystem) Remove(path string) error {
-	return os.Remove(fs.path(path))
+	full, err := fs.securePath(path)
+	if err != nil {
+		return err
+	}
+	return fs.hideRoot(os.Remove(full))
 }
 
 func (fs *fileSystem) String() string {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 )
 
 type chrootFileSystem struct {
@@ -11,11 +12,14 @@ type chrootFileSystem struct {
 	fs   VFS
 }
 
+// path maps a path inside the chroot to a path in the underlying VFS.
+//
+// The incoming path is first anchored to "/" and cleaned, so any ".." segments
+// are resolved against the chroot root and collapse at it (exactly as they do
+// at the root of a real filesystem). Without this the chroot was a plain string
+// prefix and "../.." climbed straight back out of it.
 func (fs *chrootFileSystem) path(p string) string {
-	// root always ends with /, if there are double
-	// slashes they will be fixed by the underlying
-	// VFS
-	return fs.root + p
+	return path.Join(fs.root, path.Clean("/"+filepath.ToSlash(p)))
 }
 
 func (fs *chrootFileSystem) VFS() VFS {
