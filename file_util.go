@@ -42,10 +42,18 @@ func closeFile(f *file) {
 }
 
 func fileData(f *File) ([]byte, error) {
-	if len(f.Data) == 0 || f.Mode&ModeCompress == 0 {
-		return f.Data, nil
+	// Data and Mode are written by (*file).Close under f's write lock, so
+	// reading them has to take the read side. Snapshot both and release
+	// before decompressing: that work does not touch f and should not hold
+	// other openers off the file.
+	f.RLock()
+	data, mode := f.Data, f.Mode
+	f.RUnlock()
+
+	if len(data) == 0 || mode&ModeCompress == 0 {
+		return data, nil
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(f.Data))
+	zr, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -136,35 +144,40 @@ func (f *file) Write(p []byte) (int, error) {
 }
 
 func (f *file) Close() error {
-	if !f.closed {
-		f.f.Lock()
-		defer f.f.Unlock()
-		if !f.closed {
-			if f.f.Mode&ModeCompress != 0 {
-				var buf bytes.Buffer
-				zw := zlib.NewWriter(&buf)
-				if _, err := zw.Write(f.data); err != nil {
-					return err
-				}
-				if err := zw.Close(); err != nil {
-					return err
-				}
-				if buf.Len() < len(f.data) {
-					f.f.Data = buf.Bytes()
-				} else {
-					f.f.Mode &= ^ModeCompress
-					f.f.Data = f.data
-				}
-			} else {
-				f.f.Data = f.data
-			}
-			f.closed = true
-		}
+	// closed is written here under f.f's write lock and read by Read and
+	// Seek under its read lock, so the early-out has to take the lock too.
+	// The unlocked pre-check that used to guard this raced with a concurrent
+	// Close on the same handle.
+	f.f.Lock()
+	defer f.f.Unlock()
+	if f.closed {
+		return nil
 	}
+	if f.f.Mode&ModeCompress != 0 {
+		var buf bytes.Buffer
+		zw := zlib.NewWriter(&buf)
+		if _, err := zw.Write(f.data); err != nil {
+			return err
+		}
+		if err := zw.Close(); err != nil {
+			return err
+		}
+		if buf.Len() < len(f.data) {
+			f.f.Data = buf.Bytes()
+		} else {
+			f.f.Mode &= ^ModeCompress
+			f.f.Data = f.data
+		}
+	} else {
+		f.f.Data = f.data
+	}
+	f.closed = true
 	return nil
 }
 
 func (f *file) IsCompressed() bool {
+	f.f.RLock()
+	defer f.f.RUnlock()
 	return f.f.Mode&ModeCompress != 0
 }
 

@@ -60,6 +60,10 @@ func (f *File) Size() int64 {
 }
 
 func (f *File) FileMode() os.FileMode {
+	// Mode is cleared of ModeCompress by (*file).Close under the write lock,
+	// so this read takes the read side, like Size and ModificationTime.
+	f.RLock()
+	defer f.RUnlock()
 	return f.Mode
 }
 
